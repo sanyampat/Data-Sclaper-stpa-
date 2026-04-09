@@ -181,6 +181,7 @@ BRANDS = {
 
 # ── News sources ───────────────────────────────────────────────────────────────
 SOURCES = {
+    # ── Core sources ───────────────────────────────────────────────────────────
     "Hypebeast": {
         "rss": [
             "https://hypebeast.com/feed",
@@ -200,8 +201,30 @@ SOURCES = {
         "pages": [],
         "max_p": 0,
     },
+    # ── Secondary sources ──────────────────────────────────────────────────────
+    "ComplexSneakers": {
+        "rss": ["https://www.complex.com/sneakers/rss.xml"],
+        "pages": [],
+        "max_p": 0,
+    },
+    "NiceKicks": {
+        "rss": ["https://www.nicekicks.com/feed/"],
+        "pages": [],
+        "max_p": 0,
+    },
+    "FootwearNews": {
+        "rss": ["https://footwearnews.com/feed/"],
+        "pages": [],
+        "max_p": 0,
+    },
+    # ── Luxury / fashion sources ───────────────────────────────────────────────
     "Vogue": {
         "rss": ["https://www.vogue.com/feed/rss"],
+        "pages": [],
+        "max_p": 0,
+    },
+    "WWD": {
+        "rss": ["https://wwd.com/feed/"],
         "pages": [],
         "max_p": 0,
     },

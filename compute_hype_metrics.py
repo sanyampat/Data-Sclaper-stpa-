@@ -4,6 +4,15 @@ compute_hype_metrics.py
 Research project: "Stochastic Modeling of Luxury Brand Hype through
 Limited-Edition Product Releases"
 
+What this script does
+---------------------
+Reads merged_dataset.csv (263k rows, 10 brands, 16 years of Google Trends
+hype_raw signal) and produces a clean per-event dataset suitable for:
+
+  - Poisson process estimation       (inter-arrival times between hype events)
+  - Shot-noise / hype decay modeling (exponential decay half-life after peak)
+  - Markov chain construction        (state transitions: BASELINE -> SPIKE -> DECAY)
+
 Why the previous version only produced 4 rows
 ----------------------------------------------
 The previous version read events from drops.csv, which only contains RSS
@@ -88,6 +97,9 @@ ROLLING_MIN_PTS = 14
 STATE_BINS   = [0, 15, 35, 60, 80, 101]
 STATE_LABELS = ["DORMANT", "LOW", "BUILDING", "HIGH", "PEAK"]
 
+# Optional: minimum variance threshold to filter low-signal brands
+MIN_BRAND_STD = 5.0
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 1: Load merged_dataset.csv
@@ -142,23 +154,45 @@ def load_merged(path: Path) -> pd.DataFrame:
 # Step 2: Detect hype events per brand
 # ══════════════════════════════════════════════════════════════════════════════
 
-def detect_events(series: pd.Series, brand: str) -> pd.DataFrame:
+def detect_events(series: pd.Series, brand: str, min_gap_days: int = None) -> pd.DataFrame:
     """
     Detect hype spike events in a single brand's daily hype_avg series.
 
     Uses a rolling z-score (how many standard deviations above the 60-day
     rolling mean) to identify anomalous hype spikes. Consecutive spikes within
-    MIN_EVENT_GAP_DAYS are merged into one event at their highest point.
+    min_gap_days are merged into one event at their highest point.
+
+    CHANGES (publication-grade):
+    1. Smoothing: 3-day rolling mean to reduce noise spikes
+    2. Adaptive threshold: uses 95th percentile of z-scores per brand
+    3. Event validation: filters spikes where peak < baseline * 1.2
 
     Returns one row per distinct event: brand, event_date, hype_score_t0, spike_zscore
     """
     s = series.sort_index()
 
-    rolling_mean = s.rolling(ROLLING_WINDOW, min_periods=ROLLING_MIN_PTS).mean()
-    rolling_std  = s.rolling(ROLLING_WINDOW, min_periods=ROLLING_MIN_PTS).std().clip(lower=1.0)
-    zscore       = (s - rolling_mean) / rolling_std
+    # Clip values to valid range
+    s = s.clip(0, 100)
 
-    spikes = s[(zscore > SPIKE_ZSCORE_THRESH) & (s > MIN_HYPE_VALUE)]
+    # Smoothing: 3-day rolling mean to reduce noise
+    s_smooth = s.rolling(3, min_periods=1).mean()
+
+    rolling_mean = s_smooth.rolling(ROLLING_WINDOW, min_periods=ROLLING_MIN_PTS).mean()
+    rolling_std  = s_smooth.rolling(ROLLING_WINDOW, min_periods=ROLLING_MIN_PTS).std().clip(lower=1.0)
+    zscore       = (s_smooth - rolling_mean) / rolling_std
+
+    # Adaptive threshold: top 5% of z-scores per brand (quantile-based)
+    zscore_valid = zscore.dropna()
+    if len(zscore_valid) < 10:
+        log.warning(f"  {brand}: insufficient data for quantile threshold")
+        return pd.DataFrame()
+
+    z_threshold = zscore_valid.quantile(0.95)
+    spikes = s_smooth[(zscore > z_threshold) & (s_smooth > MIN_HYPE_VALUE)]
+
+    # Use adaptive gap if provided
+    if min_gap_days is None:
+        min_gap_days = MIN_EVENT_GAP_DAYS
 
     if spikes.empty:
         log.warning(f"  {brand}: no spikes detected")
@@ -170,7 +204,7 @@ def detect_events(series: pd.Series, brand: str) -> pd.DataFrame:
     for date, val in spikes.items():
         gap = (date.to_pydatetime() - last_date).days if last_date else 9999
 
-        if gap >= MIN_EVENT_GAP_DAYS:
+        if gap >= min_gap_days:
             events.append({
                 "brand":         brand,
                 "event_date":    date,
@@ -212,38 +246,108 @@ def _nearest(s: pd.Series, target: pd.Timestamp, tol: int = 7) -> float:
 
 
 def _decay_halflife(post: pd.Series, peak_date: pd.Timestamp, baseline: float) -> float:
-    """Fit exponential decay post-peak and return half-life in days."""
+    """
+    Fit exponential decay post-peak and return half-life in days.
+
+    CHANGES (publication-grade):
+    - Primary: scipy curve_fit for exponential decay
+    - Fallback: log-linear regression if curve_fit fails or data is noisy
+    - Numerical stability: epsilon added to log calculations
+    - Rejects invalid fits (negative half-life, extreme values)
+    """
     seg = post[post.index >= peak_date]
     if len(seg) < 3:
         return np.nan
+
     amplitude = float(seg.iloc[0]) - baseline
     if amplitude <= 0:
         return np.nan
+
     t = np.array([(d - peak_date).days for d in seg.index], dtype=float)
     y = seg.values.astype(float)
+
+    # Primary method: curve_fit
     try:
-        popt, _ = curve_fit(
+        popt, pcov = curve_fit(
             lambda t, lam: amplitude * np.exp(-lam * t) + baseline,
             t, y, p0=[0.05], bounds=(1e-6, 2.0), maxfev=3000,
         )
+        # Check fit quality: reject if variance is too high
+        residuals = y - (amplitude * np.exp(-popt[0] * t) + baseline)
+        rss = np.sum(residuals ** 2)
+        if rss / len(y) > amplitude ** 2:  # Poor fit
+            raise ValueError("Poor fit quality")
         hl = np.log(2) / popt[0]
+        if 0 < hl < 10_000:
+            return round(float(hl), 1)
+    except Exception:
+        pass  # Fall through to log-linear fallback
+
+    # Fallback: log-linear regression (more robust to noise)
+    # y = baseline + amplitude * exp(-beta * t)
+    # log(y - baseline) = log(amplitude) - beta * t
+    epsilon = 1e-6
+    y_adj = y - baseline + epsilon
+    y_log = np.log(np.maximum(y_adj, epsilon))
+
+    # Filter out invalid values
+    valid = np.isfinite(y_log)
+    if valid.sum() < 3:
+        return np.nan
+
+    t_valid = t[valid]
+    y_valid = y_log[valid]
+
+    try:
+        slope, intercept = np.polyfit(t_valid, y_valid, 1)
+        beta = -slope
+        if beta <= 0:
+            return np.nan  # Invalid: would imply growing signal
+        hl = np.log(2) / beta
         return round(float(hl), 1) if 0 < hl < 10_000 else np.nan
     except Exception:
         return np.nan
 
 
-def _state(val: float) -> str:
-    """Map hype_raw value to Markov state label."""
+def _state(val: float, quantiles: np.ndarray = None) -> str:
+    """
+    Map hype_raw value to Markov state label.
+
+    CHANGES (publication-grade):
+    - Uses quantile-based states instead of fixed bins
+    - States: LOW (<q1), MEDIUM (q1-q2), HIGH (q2-q3), VIRAL (>q3)
+    - Falls back to fixed bins if quantiles not provided
+    """
     if np.isnan(val):
         return np.nan
+
+    if quantiles is not None:
+        q1, q2, q3 = quantiles
+        if val < q1:
+            return "LOW"
+        elif val < q2:
+            return "MEDIUM"
+        elif val < q3:
+            return "HIGH"
+        else:
+            return "VIRAL"
+
+    # Fallback to fixed bins for backward compatibility
     for i, (lo, hi) in enumerate(zip(STATE_BINS[:-1], STATE_BINS[1:])):
         if lo <= val < hi:
             return STATE_LABELS[i]
     return STATE_LABELS[-1]
 
 
-def compute_event_metrics(event_date: pd.Timestamp, series: pd.Series) -> dict:
-    """All hype metrics for one event. Uses only pre-sorted series slices."""
+def compute_event_metrics(event_date: pd.Timestamp, series: pd.Series,
+                          brand_quantiles: np.ndarray = None) -> dict:
+    """
+    All hype metrics for one event. Uses only pre-sorted series slices.
+
+    CHANGES (publication-grade):
+    - Event validation filter: rejects events where hype_peak < baseline * 1.2
+    - Quantile-based states passed via brand_quantiles
+    """
     ed = pd.Timestamp(event_date).normalize()
     T  = pd.Timedelta
 
@@ -272,6 +376,12 @@ def compute_event_metrics(event_date: pd.Timestamp, series: pd.Series) -> dict:
     hype_d30 = _nearest(series, ed + T(30, "D"))
     hype_d60 = _nearest(series, ed + T(60, "D"))
 
+    # Event validation filter: reject weak spikes
+    # A real event should have peak at least 20% above baseline
+    if not np.isnan(baseline_hype) and not np.isnan(hype_peak):
+        if hype_peak < baseline_hype * 1.2:
+            return None  # Filter out non-meaningful spikes
+
     hype_lift_pct = (
         round((hype_peak - baseline_hype) / baseline_hype * 100, 2)
         if not np.isnan(baseline_hype) and baseline_hype > 0 and not np.isnan(hype_peak)
@@ -295,10 +405,10 @@ def compute_event_metrics(event_date: pd.Timestamp, series: pd.Series) -> dict:
         "hype_d30":           _r(hype_d30),
         "hype_d60":           _r(hype_d60),
         "hype_decay_halflife": decay_hl,
-        "prev_state":         _state(prev_avg),
-        "state_t0":           _state(hype_t0),
-        "state_d7":           _state(hype_d7),
-        "state_d30":          _state(hype_d30),
+        "prev_state":         _state(prev_avg, brand_quantiles),
+        "state_t0":           _state(hype_t0, brand_quantiles),
+        "state_d7":           _state(hype_d7, brand_quantiles),
+        "state_d30":          _state(hype_d30, brand_quantiles),
     }
 
 
@@ -320,11 +430,28 @@ def run(merged_path: Path = MERGED_CSV, output_path: Path = OUTPUT_CSV) -> pd.Da
     }
     log.info(f"Brand series built for: {sorted(brand_series.keys())}")
 
+    # Filter low-variance brands (optional improvement)
+    filtered_brands = {}
+    for brand, s in brand_series.items():
+        if s.std() < MIN_BRAND_STD:
+            log.info(f"  {brand}: skipping (std={s.std():.2f} < {MIN_BRAND_STD})")
+        else:
+            filtered_brands[brand] = s
+    brand_series = filtered_brands
+
+    # Adaptive event gap: scale with series length (2% of timeline, min 7 days)
+    base_series = next(iter(brand_series.values())) if brand_series else None
+    if base_series is not None:
+        min_gap = max(7, int(len(base_series) * 0.02))
+        log.info(f"  Adaptive MIN_EVENT_GAP_DAYS: {min_gap} (2% of timeline)")
+    else:
+        min_gap = MIN_EVENT_GAP_DAYS
+
     # Detect events
     log.info("Detecting hype events (rolling z-score spike detector)...")
     all_events = []
     for brand, s in brand_series.items():
-        evts = detect_events(s, brand)
+        evts = detect_events(s, brand, min_gap_days=min_gap)
         if not evts.empty:
             all_events.append(evts)
             log.info(f"  {brand:<20}: {len(evts):3d} events")
@@ -336,13 +463,21 @@ def run(merged_path: Path = MERGED_CSV, output_path: Path = OUTPUT_CSV) -> pd.Da
     events_df = pd.concat(all_events, ignore_index=True)
     log.info(f"Total events: {len(events_df):,} across {events_df['brand'].nunique()} brands")
 
+    # Pre-compute quantiles per brand for Markov states
+    brand_quantiles = {
+        brand: s.quantile([0.25, 0.50, 0.75]).values
+        for brand, s in brand_series.items()
+    }
+
     # Compute metrics
     log.info("Computing per-event hype metrics...")
     rows = []
     for _, ev in events_df.iterrows():
         brand      = str(ev["brand"])
         event_date = ev["event_date"]
-        metrics    = compute_event_metrics(event_date, brand_series[brand])
+        metrics    = compute_event_metrics(event_date, brand_series[brand], brand_quantiles[brand])
+        if metrics is None:  # Filtered out by event validation
+            continue
         rows.append({
             "brand":        brand,
             "event_date":   event_date.date(),
@@ -415,8 +550,18 @@ def _quality_report(df: pd.DataFrame) -> None:
 
     iat = pd.to_numeric(df["days_since_last_event"], errors="coerce").dropna()
     if not iat.empty:
-        log.info(f"    Poisson lambda (events/day): {1/iat.mean():.4f}  "
-                 f"(mean gap: {iat.mean():.1f} days)")
+        mean_gap = iat.mean()
+        var_gap = iat.var()
+        log.info(f"    Poisson lambda (events/day): {1/mean_gap:.4f}  "
+                 f"(mean gap: {mean_gap:.1f} days)")
+        log.info(f"    Inter-arrival variance: {var_gap:.1f} (mean={mean_gap:.1f})")
+        # Poisson validation: variance ≈ mean
+        if var_gap < 0.5 * mean_gap:
+            log.info("    WARNING: variance << mean — under-dispersed (regular spacing)")
+        elif var_gap > 2.0 * mean_gap:
+            log.info("    WARNING: variance >> mean — over-dispersed (clustering, NOT Poisson)")
+        else:
+            log.info("    Poisson assumption: reasonable (variance ≈ mean)")
 
     if "state_t0" in df.columns:
         dist = df["state_t0"].value_counts(normalize=True).mul(100).round(1).to_dict()
@@ -435,13 +580,10 @@ if __name__ == "__main__":
     p.add_argument("--output",   default=str(OUTPUT_CSV))
     p.add_argument("--zscore",   type=float, default=SPIKE_ZSCORE_THRESH)
     p.add_argument("--min-hype", type=float, default=MIN_HYPE_VALUE)
-    p.add_argument("--gap",      type=int,   default=MIN_EVENT_GAP_DAYS)
     args = p.parse_args()
 
     SPIKE_ZSCORE_THRESH = args.zscore
     MIN_HYPE_VALUE      = args.min_hype
-    MIN_EVENT_GAP_DAYS  = args.gap
 
     result = run(Path(args.input), Path(args.output))
     sys.exit(0 if not result.empty else 1)
-
